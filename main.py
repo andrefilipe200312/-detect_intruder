@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import argparse
+import os
 import statistics
+import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -24,6 +27,68 @@ class GuardState:
     alert_active: bool = False
     extra_face_streak: int = 0
     trigger_reason: str = ""
+
+
+@dataclass
+class AudioPlayer:
+    video_path: Path
+    pygame: object | None = None
+    extracted_audio_path: Path | None = None
+    ready: bool = False
+
+    def initialize(self) -> None:
+        try:
+            os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
+            import pygame
+            from imageio_ffmpeg import get_ffmpeg_exe
+        except ImportError as error:
+            print(
+                f"Aviso: audio desativado porque falta uma dependencia ({error}).",
+                file=sys.stderr,
+            )
+            return
+
+        audio_path = extract_audio_track(self.video_path, Path(get_ffmpeg_exe()))
+        if audio_path is None:
+            return
+
+        try:
+            pygame.mixer.init()
+            pygame.mixer.music.load(str(audio_path))
+        except Exception as error:
+            print(f"Aviso: nao consegui iniciar o audio do video ({error}).", file=sys.stderr)
+            if pygame.mixer.get_init():
+                pygame.mixer.quit()
+            safe_unlink(audio_path)
+            return
+
+        self.pygame = pygame
+        self.extracted_audio_path = audio_path
+        self.ready = True
+
+    def play_from_start(self) -> None:
+        if not self.ready or self.pygame is None:
+            return
+        self.pygame.mixer.music.stop()
+        self.pygame.mixer.music.play()
+
+    def pause(self) -> None:
+        if not self.ready or self.pygame is None:
+            return
+        if self.pygame.mixer.music.get_busy():
+            self.pygame.mixer.music.pause()
+
+    def close(self) -> None:
+        if self.pygame is not None:
+            try:
+                self.pygame.mixer.music.stop()
+                unload = getattr(self.pygame.mixer.music, "unload", None)
+                if callable(unload):
+                    unload()
+            finally:
+                if self.pygame.mixer.get_init():
+                    self.pygame.mixer.quit()
+        safe_unlink(self.extracted_audio_path)
 
 
 def parse_args() -> argparse.Namespace:
@@ -129,6 +194,56 @@ def safe_fps(video_capture: cv2.VideoCapture) -> int:
     if fps and fps > 1:
         return int(round(fps))
     return 30
+
+
+def safe_unlink(path: Path | None) -> None:
+    if path is None:
+        return
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def extract_audio_track(video_path: Path, ffmpeg_executable: Path) -> Path | None:
+    temp_file = tempfile.NamedTemporaryFile(
+        prefix="screenguard_audio_",
+        suffix=".wav",
+        delete=False,
+    )
+    audio_path = Path(temp_file.name)
+    temp_file.close()
+
+    command = [
+        str(ffmpeg_executable),
+        "-y",
+        "-i",
+        str(video_path),
+        "-vn",
+        "-acodec",
+        "pcm_s16le",
+        "-ar",
+        "44100",
+        "-ac",
+        "2",
+        str(audio_path),
+    ]
+    result = subprocess.run(command, capture_output=True, text=True)
+
+    if result.returncode == 0 and audio_path.exists() and audio_path.stat().st_size > 0:
+        return audio_path
+
+    stderr_text = result.stderr.lower()
+    if (
+        "does not contain any stream" in stderr_text
+        or "output file #0 does not contain any stream" in stderr_text
+        or "stream map" in stderr_text
+    ):
+        print("Aviso: o video nao tem uma faixa de audio utilizavel.", file=sys.stderr)
+    else:
+        print("Aviso: falha a extrair o audio do video; continuo apenas com imagem.", file=sys.stderr)
+    safe_unlink(audio_path)
+    return None
 
 
 def put_text(
@@ -413,8 +528,11 @@ def main() -> int:
         min_detection_confidence=args.min_detection_confidence,
     )
     state = reset_state()
+    audio_player = AudioPlayer(video_path=video_path)
 
     configure_window(fullscreen=not args.no_fullscreen)
+    audio_player.initialize()
+    audio_player.play_from_start()
 
     try:
         while True:
@@ -431,6 +549,7 @@ def main() -> int:
             )
             webcam_preview = annotate_webcam_preview(webcam_frame, face_boxes, face_count)
             now = time.monotonic()
+            alert_just_triggered = False
 
             if state.baseline_faces is None:
                 state.calibration_counts.append(face_count)
@@ -447,11 +566,15 @@ def main() -> int:
                     state.extra_face_streak += 1
                     if state.extra_face_streak >= args.trigger_frames:
                         state.alert_active = True
+                        alert_just_triggered = True
                         state.trigger_reason = (
                             f"Detetados {face_count} rostos para baseline {state.baseline_faces}."
                         )
                 else:
                     state.extra_face_streak = 0
+
+            if alert_just_triggered:
+                audio_player.pause()
 
             if state.alert_active:
                 frame_to_show = build_hostile_frame(
@@ -467,6 +590,7 @@ def main() -> int:
                     if args.no_loop:
                         break
                     video_capture.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                    audio_player.play_from_start()
                     continue
                 display_height, display_width = video_frame.shape[:2]
                 frame_to_show = render_playback_frame(
@@ -487,7 +611,9 @@ def main() -> int:
             if key == ord("r"):
                 video_capture.set(cv2.CAP_PROP_POS_FRAMES, 0)
                 state = reset_state()
+                audio_player.play_from_start()
     finally:
+        audio_player.close()
         detector.close()
         video_capture.release()
         camera_capture.release()
