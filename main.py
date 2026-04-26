@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -70,6 +71,7 @@ class DetectedFace:
     box: tuple[int, int, int, int]
     confidence: float
     descriptor: np.ndarray | None
+    nose_tip: tuple[float, float] | None = None
     label: str = "Rosto"
     status: str = "pending"
     similarity: float = 0.0
@@ -86,6 +88,8 @@ class GuardState:
     next_temporary_label: int = 1
     last_authorized_labels: list[str] = field(default_factory=list)
     last_intruder_labels: list[str] = field(default_factory=list)
+    nose_drawing_canvas: np.ndarray | None = None
+    last_nose_draw_position: tuple[int, int] | None = None
 
 
 @dataclass
@@ -287,6 +291,50 @@ def configure_window(fullscreen: bool) -> None:
         )
 
 
+def primary_screen_size() -> tuple[int, int] | None:
+    if sys.platform != "win32":
+        return None
+
+    try:
+        import ctypes
+
+        user32 = ctypes.windll.user32
+        user32.SetProcessDPIAware()
+        width = int(user32.GetSystemMetrics(0))
+        height = int(user32.GetSystemMetrics(1))
+    except Exception:
+        return None
+
+    if width <= 0 or height <= 0:
+        return None
+    return width, height
+
+
+def video_capture_size(video_capture: cv2.VideoCapture) -> tuple[int, int]:
+    width = int(video_capture.get(cv2.CAP_PROP_FRAME_WIDTH)) or 1280
+    height = int(video_capture.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 720
+    return width, height
+
+
+def display_target_size(video_capture: cv2.VideoCapture, fullscreen: bool) -> tuple[int, int]:
+    if fullscreen:
+        screen_size = primary_screen_size()
+        if screen_size is not None:
+            return screen_size
+    return video_capture_size(video_capture)
+
+
+def resize_for_display(frame: np.ndarray, size: tuple[int, int]) -> np.ndarray:
+    width, height = size
+    if frame.shape[1] == width and frame.shape[0] == height:
+        return frame
+
+    interpolation = cv2.INTER_AREA
+    if width > frame.shape[1] or height > frame.shape[0]:
+        interpolation = cv2.INTER_CUBIC
+    return cv2.resize(frame, (width, height), interpolation=interpolation)
+
+
 def safe_fps(video_capture: cv2.VideoCapture) -> int:
     fps = video_capture.get(cv2.CAP_PROP_FPS)
     if fps and fps > 1:
@@ -359,7 +407,10 @@ def ensure_model_file(model_dir: Path, filename: str) -> Path:
     spec = MODEL_SPECS[filename]
     destination = model_dir / filename
     if destination.exists() and destination.stat().st_size > 0:
-        return destination
+        existing_hash = file_sha256(destination)
+        if existing_hash.lower() == spec["sha256"].lower():
+            return destination
+        safe_unlink(destination)
 
     model_dir.mkdir(parents=True, exist_ok=True)
     temp_destination = destination.with_suffix(destination.suffix + ".part")
@@ -393,13 +444,34 @@ def ensure_model_file(model_dir: Path, filename: str) -> Path:
     return destination
 
 
+def opencv_safe_model_path(path: Path) -> Path:
+    try:
+        str(path).encode("ascii")
+        return path
+    except UnicodeEncodeError:
+        pass
+
+    safe_dir = Path(tempfile.gettempdir()) / "screenguard_models"
+    safe_dir.mkdir(parents=True, exist_ok=True)
+    safe_path = safe_dir / path.name
+
+    if not safe_path.exists() or safe_path.stat().st_size != path.stat().st_size:
+        shutil.copy2(path, safe_path)
+
+    return safe_path
+
+
 def create_face_embedding_engine(
     models_dir: Path,
     min_detection_confidence: float,
 ) -> FaceEmbeddingEngine:
     resolved_models_dir = models_dir.expanduser().resolve()
-    detector_path = ensure_model_file(resolved_models_dir, "face_detection_yunet_2023mar.onnx")
-    recognizer_path = ensure_model_file(resolved_models_dir, "face_recognition_sface_2021dec.onnx")
+    detector_path = opencv_safe_model_path(
+        ensure_model_file(resolved_models_dir, "face_detection_yunet_2023mar.onnx")
+    )
+    recognizer_path = opencv_safe_model_path(
+        ensure_model_file(resolved_models_dir, "face_recognition_sface_2021dec.onnx")
+    )
 
     if not hasattr(cv2, "FaceDetectorYN_create") or not hasattr(cv2, "FaceRecognizerSF_create"):
         raise RuntimeError(
@@ -452,6 +524,73 @@ def put_text(
         thickness,
         cv2.LINE_AA,
     )
+
+
+def text_size(text: str, scale: float, thickness: int = 2) -> tuple[int, int]:
+    (width, height), baseline = cv2.getTextSize(
+        text,
+        cv2.FONT_HERSHEY_SIMPLEX,
+        scale,
+        thickness,
+    )
+    return width, height + baseline
+
+
+def fitted_text_scale(
+    text: str,
+    max_width: int,
+    preferred_scale: float,
+    min_scale: float = 0.42,
+    thickness: int = 2,
+) -> float:
+    if max_width <= 0:
+        return min_scale
+
+    scale = preferred_scale
+    while scale > min_scale and text_size(text, scale, thickness)[0] > max_width:
+        scale -= 0.04
+    return max(min_scale, scale)
+
+
+def wrap_text_lines(
+    text: str,
+    max_width: int,
+    scale: float,
+    thickness: int = 2,
+) -> list[str]:
+    words = text.split()
+    if not words:
+        return [""]
+
+    lines: list[str] = []
+    current = words[0]
+    for word in words[1:]:
+        candidate = f"{current} {word}"
+        if text_size(candidate, scale, thickness)[0] <= max_width:
+            current = candidate
+        else:
+            lines.append(current)
+            current = word
+    lines.append(current)
+    return lines
+
+
+def put_wrapped_text(
+    frame: np.ndarray,
+    text: str,
+    origin: tuple[int, int],
+    max_width: int,
+    scale: float = 0.7,
+    color: tuple[int, int, int] = (255, 255, 255),
+    thickness: int = 2,
+    line_gap: int = 8,
+) -> int:
+    x, y = origin
+    line_height = text_size("Ag", scale, thickness)[1] + line_gap
+    for line in wrap_text_lines(text, max_width, scale, thickness):
+        put_text(frame, line, (x, y), scale=scale, color=color, thickness=thickness)
+        y += line_height
+    return y
 
 
 def draw_panel(frame: np.ndarray, top_left: tuple[int, int], size: tuple[int, int]) -> None:
@@ -529,6 +668,84 @@ def format_label_list(labels: list[str], fallback: str, max_chars: int = 52) -> 
 
 def box_area(box: tuple[int, int, int, int]) -> int:
     return max(0, box[2]) * max(0, box[3])
+
+
+def intruder_nose_position(
+    faces: list[DetectedFace],
+    webcam_shape: tuple[int, ...],
+) -> tuple[float, float] | None:
+    intruder_faces = [
+        face
+        for face in faces
+        if face.status in {"unauthorized", "unknown"} and face.nose_tip is not None
+    ]
+    if not intruder_faces:
+        return None
+
+    face = max(intruder_faces, key=lambda detected_face: box_area(detected_face.box))
+    frame_height, frame_width = webcam_shape[:2]
+    if frame_width <= 0 or frame_height <= 0 or face.nose_tip is None:
+        return None
+
+    nose_x, nose_y = face.nose_tip
+    normalized_x = 1.0 - clamp(nose_x / float(frame_width), 0.0, 1.0)
+    normalized_y = clamp(nose_y / float(frame_height), 0.0, 1.0)
+    return normalized_x, normalized_y
+
+
+def update_nose_drawing(
+    state: GuardState,
+    nose_position: tuple[float, float] | None,
+    size: tuple[int, int],
+) -> None:
+    width, height = size
+    if width <= 0 or height <= 0:
+        return
+
+    if state.nose_drawing_canvas is None or state.nose_drawing_canvas.shape[:2] != (height, width):
+        state.nose_drawing_canvas = np.zeros((height, width, 3), dtype=np.uint8)
+        state.last_nose_draw_position = None
+
+    if nose_position is None:
+        state.last_nose_draw_position = None
+        return
+
+    x = int(clamp(round(nose_position[0] * (width - 1)), 0, width - 1))
+    y = int(clamp(round(nose_position[1] * (height - 1)), 0, height - 1))
+    current_position = (x, y)
+
+    if state.last_nose_draw_position is not None:
+        cv2.line(
+            state.nose_drawing_canvas,
+            state.last_nose_draw_position,
+            current_position,
+            (80, 245, 255),
+            max(4, int(round(min(width, height) * 0.008))),
+            cv2.LINE_AA,
+        )
+    cv2.circle(state.nose_drawing_canvas, current_position, 5, (255, 255, 255), -1, cv2.LINE_AA)
+    state.last_nose_draw_position = current_position
+
+
+def overlay_nose_drawing(frame: np.ndarray, drawing_canvas: np.ndarray | None) -> None:
+    if drawing_canvas is None:
+        return
+    if drawing_canvas.shape[:2] != frame.shape[:2]:
+        return
+
+    mask = cv2.cvtColor(drawing_canvas, cv2.COLOR_BGR2GRAY)
+    if cv2.countNonZero(mask) == 0:
+        return
+    mask = cv2.GaussianBlur(mask, (5, 5), 0)
+    alpha = (mask.astype(np.float32) / 255.0 * 0.92)[:, :, None]
+    blended = frame.astype(np.float32) * (1.0 - alpha) + drawing_canvas.astype(np.float32) * alpha
+    np.copyto(frame, blended.astype(np.uint8))
+
+
+def clear_nose_drawing(state: GuardState) -> None:
+    if state.nose_drawing_canvas is not None:
+        state.nose_drawing_canvas.fill(0)
+    state.last_nose_draw_position = None
 
 
 def profile_labels(profiles: list[IdentityProfile]) -> list[str]:
@@ -609,6 +826,12 @@ def detect_faces(
         x2 = int(clamp(round(x + w), x1 + 1, frame_width))
         y2 = int(clamp(round(y + h), y1 + 1, frame_height))
         pixel_box = (x1, y1, x2 - x1, y2 - y1)
+        nose_tip = None
+        if detection.size >= 10:
+            nose_tip = (
+                float(clamp(float(detection[8]), 0.0, float(max(frame_width - 1, 0)))),
+                float(clamp(float(detection[9]), 0.0, float(max(frame_height - 1, 0)))),
+            )
 
         descriptor = extract_face_embedding(engine, webcam_frame, detection)
         confidence = float(detection[-1]) if detection.size else 0.0
@@ -617,6 +840,7 @@ def detect_faces(
                 box=pixel_box,
                 confidence=confidence,
                 descriptor=descriptor,
+                nose_tip=nose_tip,
             )
         )
 
@@ -771,6 +995,15 @@ def annotate_webcam_preview(
         x, y, w, h = face.box
         color = status_color(face.status)
         cv2.rectangle(preview, (x, y), (x + w, y + h), color, 2)
+        if face.nose_tip is not None:
+            cv2.circle(
+                preview,
+                (int(round(face.nose_tip[0])), int(round(face.nose_tip[1]))),
+                4,
+                color,
+                -1,
+                cv2.LINE_AA,
+            )
         draw_tag(preview, face.label, (x, max(24, y - 6)), color)
 
     draw_panel(preview, (10, 10), (250, 68))
@@ -828,63 +1061,51 @@ def render_playback_frame(
     now: float,
 ) -> np.ndarray:
     frame = video_frame.copy()
-    panel_width = max(330, min(760, frame.shape[1] - 40))
-    panel_height = 228
+    panel_width = max(300, min(430, frame.shape[1] - 40))
+    panel_height = 166
     draw_panel(frame, (20, 20), (panel_width, panel_height))
 
     if not state.authorized_profiles:
         progress = calibration_progress(state, calibration_seconds, now)
-        put_text(frame, "A calibrar identidades...", (40, 60), scale=0.9, color=(255, 220, 120))
-        put_text(frame, f"Pessoas visiveis: {len(faces)}", (40, 95), scale=0.7)
-        put_text(frame, f"Perfis aprendidos: {len(state.calibration_profiles)}", (40, 126), scale=0.7)
+        put_text(frame, "A calibrar...", (36, 52), scale=0.56, color=(255, 220, 120))
+        put_text(frame, f"Pessoas: {len(faces)}", (36, 80), scale=0.46)
+        put_text(frame, f"Perfis: {len(state.calibration_profiles)}", (36, 105), scale=0.46)
         if progress < 1.0:
-            put_text(frame, f"Tempo alvo: {calibration_seconds:.1f}s", (40, 157), scale=0.7)
-            bar_x = 40
-            bar_y = 176
+            put_text(frame, f"{calibration_seconds:.1f}s", (36, 130), scale=0.44)
+            bar_x = 82
+            bar_y = 119
             bar_width = panel_width - 80
-            cv2.rectangle(frame, (bar_x, bar_y), (bar_x + bar_width, bar_y + 18), (80, 80, 80), 1)
+            cv2.rectangle(frame, (bar_x, bar_y), (bar_x + bar_width, bar_y + 12), (80, 80, 80), 1)
             cv2.rectangle(
                 frame,
                 (bar_x, bar_y),
-                (bar_x + int(bar_width * progress), bar_y + 18),
+                (bar_x + int(bar_width * progress), bar_y + 12),
                 (70, 190, 255),
                 -1,
             )
         else:
             put_text(
                 frame,
-                "Aguardando um rosto estavel para autorizar.",
-                (40, 157),
-                scale=0.66,
+                "A aguardar rosto estavel.",
+                (36, 130),
+                scale=0.44,
                 color=(0, 165, 255),
             )
     else:
         current_labels = unique_labels([face.label for face in faces if face.status != "pending"])
-        put_text(frame, "Vigilancia de identidade ativa", (40, 60), scale=0.9, color=(110, 235, 140))
-        put_text(
-            frame,
-            f"Autorizadas: {format_label_list(profile_labels(state.authorized_profiles), 'nenhuma')}",
-            (40, 95),
-            scale=0.65,
-        )
-        put_text(
-            frame,
-            f"No frame: {format_label_list(current_labels, 'ninguem')}",
-            (40, 126),
-            scale=0.65,
-        )
-        put_text(
-            frame,
-            f"Disparo apos {trigger_frames} frames com intruso",
-            (40, 157),
-            scale=0.62,
-        )
+        authorized_text = format_label_list(profile_labels(state.authorized_profiles), "nenhuma", max_chars=26)
+        current_text = format_label_list(current_labels, "ninguem", max_chars=28)
+
+        put_text(frame, "Vigilancia ativa", (36, 52), scale=0.56, color=(110, 235, 140))
+        put_text(frame, f"Aut.: {authorized_text}", (36, 80), scale=0.44)
+        put_text(frame, f"Agora: {current_text}", (36, 105), scale=0.44)
+        put_text(frame, f"Intruso: {state.intruder_streak}/{trigger_frames}", (36, 130), scale=0.44)
         if state.last_intruder_labels:
             put_text(
                 frame,
-                f"Intruso em observacao: {format_label_list(state.last_intruder_labels, 'desconhecido')}",
-                (40, 188),
-                scale=0.62,
+                f"Alerta: {format_label_list(state.last_intruder_labels, 'desconhecido', max_chars=22)}",
+                (36, 155),
+                scale=0.42,
                 color=(0, 165, 255),
             )
 
@@ -915,6 +1136,7 @@ def build_hostile_frame(
     trigger_reason: str,
     webcam_preview: np.ndarray,
     custom_image: np.ndarray | None,
+    nose_drawing_canvas: np.ndarray | None,
 ) -> np.ndarray:
     width, height = size
     if custom_image is not None:
@@ -922,27 +1144,82 @@ def build_hostile_frame(
     else:
         frame = generate_hostile_background(width, height)
 
-    draw_panel(frame, (40, 40), (min(780, width - 80), min(320, height - 80)))
-    put_text(frame, "PRIVACIDADE BLOQUEADA", (70, 110), scale=1.25, color=(40, 70, 255), thickness=3)
-    put_text(frame, "Foi detetada uma pessoa nao autorizada junto ao ecra.", (70, 160), scale=0.78)
+    overlay_nose_drawing(frame, nose_drawing_canvas)
+
+    margin = max(24, int(round(min(width, height) * 0.045)))
+    panel_x = margin
+    panel_y = margin
+    panel_width = max(420, min(width - (margin * 2), int(round(width * 0.76))))
+    panel_height = max(330, min(height - (margin * 2), 430))
+    content_x = panel_x + 28
+    content_y = panel_y + 64
+    content_width = max(220, panel_width - 56)
+
+    draw_panel(frame, (panel_x, panel_y), (panel_width, panel_height))
+
+    title = "PRIVACIDADE BLOQUEADA"
+    title_scale = fitted_text_scale(title, content_width, preferred_scale=0.9, min_scale=0.52, thickness=3)
     put_text(
         frame,
+        title,
+        (content_x, content_y),
+        scale=title_scale,
+        color=(40, 70, 255),
+        thickness=3,
+    )
+    content_y += text_size(title, title_scale, 3)[1] + 24
+
+    content_y = put_wrapped_text(
+        frame,
+        "Foi detetada uma pessoa nao autorizada junto ao ecra.",
+        (content_x, content_y),
+        content_width,
+        scale=0.54,
+    )
+    content_y += 8
+    content_y = put_wrapped_text(
+        frame,
         f"Detetada: {format_label_list(intruder_labels, 'desconhecida')}",
-        (70, 200),
-        scale=0.76,
+        (content_x, content_y),
+        content_width,
+        scale=0.58,
         color=(120, 220, 255),
     )
+    content_y += 6
     if authorized_labels:
-        put_text(
+        content_y = put_wrapped_text(
             frame,
             f"Autorizadas: {format_label_list(authorized_labels, 'ninguem')}",
-            (70, 238),
-            scale=0.72,
+            (content_x, content_y),
+            content_width,
+            scale=0.54,
         )
+        content_y += 6
     if trigger_reason:
-        put_text(frame, trigger_reason, (70, 274), scale=0.6, color=(255, 220, 120))
-    put_text(frame, "Afasta-te e pressiona R para recalibrar.", (70, 308), scale=0.76, color=(120, 220, 255))
-    put_text(frame, "Q sair", (70, 342), scale=0.72)
+        content_y = put_wrapped_text(
+            frame,
+            trigger_reason,
+            (content_x, content_y),
+            content_width,
+            scale=0.5,
+            color=(255, 220, 120),
+        )
+        content_y += 8
+    content_y = put_wrapped_text(
+        frame,
+        "Afasta-te e pressiona R para recalibrar.",
+        (content_x, content_y),
+        content_width,
+        scale=0.54,
+        color=(120, 220, 255),
+    )
+    put_wrapped_text(
+        frame,
+        "Move o nariz para desenhar | C limpar | Q sair",
+        (content_x, content_y + 8),
+        content_width,
+        scale=0.48,
+    )
     overlay_webcam_preview(frame, webcam_preview)
     return frame
 
@@ -1038,8 +1315,8 @@ def main() -> int:
 
     fps = safe_fps(video_capture)
     frame_delay_ms = max(1, int(1000 / fps))
-    display_width = int(video_capture.get(cv2.CAP_PROP_FRAME_WIDTH)) or 1280
-    display_height = int(video_capture.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 720
+    fullscreen = not args.no_fullscreen
+    display_width, display_height = display_target_size(video_capture, fullscreen)
 
     try:
         engine = create_face_embedding_engine(
@@ -1056,7 +1333,7 @@ def main() -> int:
     state = reset_state()
     audio_player = AudioPlayer(video_path=video_path)
 
-    configure_window(fullscreen=not args.no_fullscreen)
+    configure_window(fullscreen=fullscreen)
     audio_player.initialize()
     audio_player.play_from_start()
 
@@ -1134,6 +1411,11 @@ def main() -> int:
                 audio_player.pause()
 
             if state.alert_active:
+                update_nose_drawing(
+                    state=state,
+                    nose_position=intruder_nose_position(faces, webcam_frame.shape),
+                    size=(display_width, display_height),
+                )
                 frame_to_show = build_hostile_frame(
                     size=(display_width, display_height),
                     intruder_labels=state.last_intruder_labels,
@@ -1141,6 +1423,7 @@ def main() -> int:
                     trigger_reason=state.trigger_reason,
                     webcam_preview=webcam_preview,
                     custom_image=hostile_image,
+                    nose_drawing_canvas=state.nose_drawing_canvas,
                 )
             else:
                 video_ok, video_frame = video_capture.read()
@@ -1150,7 +1433,9 @@ def main() -> int:
                     video_capture.set(cv2.CAP_PROP_POS_FRAMES, 0)
                     audio_player.play_from_start()
                     continue
-                display_height, display_width = video_frame.shape[:2]
+                if not fullscreen:
+                    display_height, display_width = video_frame.shape[:2]
+                video_frame = resize_for_display(video_frame, (display_width, display_height))
                 frame_to_show = render_playback_frame(
                     video_frame=video_frame,
                     webcam_preview=webcam_preview,
@@ -1170,6 +1455,8 @@ def main() -> int:
                 video_capture.set(cv2.CAP_PROP_POS_FRAMES, 0)
                 state = reset_state()
                 audio_player.play_from_start()
+            if key == ord("c"):
+                clear_nose_drawing(state)
     finally:
         audio_player.close()
         video_capture.release()

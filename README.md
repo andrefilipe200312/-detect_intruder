@@ -8,8 +8,8 @@ Prototipo em Python que reproduz um video com imagem e som enquanto vigia a webc
 2. Durante os primeiros `2.0` segundos o sistema aprende perfis de identidade dos rostos visiveis.
 3. Depois disso, cada rosto detetado e comparado com os perfis autorizados.
 4. Se aparecer uma pessoa nao autorizada ou desconhecida durante varios frames seguidos, o sistema entra em alerta.
-5. Em alerta, o video deixa de avancar, o audio pausa e aparece um ecra hostil.
-6. Carrega `R` para reiniciar o video, voltar o audio ao inicio e recalibrar. Carrega `Q` para sair.
+5. Em alerta, o video deixa de avancar, o audio pausa e aparece um ecra hostil onde o intruso pode desenhar movendo o nariz.
+6. Carrega `C` para limpar o desenho, `R` para reiniciar o video, voltar o audio ao inicio e recalibrar, ou `Q` para sair.
 
 ## Instalar
 
