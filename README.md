@@ -8,8 +8,8 @@ Prototipo em Python que reproduz um video com imagem e som enquanto vigia a webc
 2. Durante os primeiros `2.0` segundos o sistema aprende perfis de identidade dos rostos visiveis.
 3. Depois disso, cada rosto detetado e comparado com os perfis autorizados.
 4. Se aparecer uma pessoa nao autorizada ou desconhecida durante varios frames seguidos, o sistema entra em alerta.
-5. Em alerta, o video deixa de avancar, o audio pausa e aparece um ecra hostil onde o intruso pode desenhar movendo o nariz.
-6. Carrega `C` para limpar o desenho, `R` para reiniciar o video, voltar o audio ao inicio e recalibrar, ou `Q` para sair.
+5. Em alerta, o video deixa de avancar, o audio pausa e aparece um ecra hostil onde o intruso pode desenhar movendo o nariz, agora com estabilizacao para reduzir tremores.
+6. Carrega `S` para gravar o desenho, `C` para limpar, `R` para reiniciar o video, voltar o audio ao inicio e recalibrar, ou `Q` para sair.
 
 ## Instalar
 
@@ -24,6 +24,22 @@ pip install -r requirements.txt
 Na primeira execucao, o programa extrai temporariamente a faixa de audio do video para a reproduzir em paralelo com os frames mostrados no OpenCV.
 
 Tambem na primeira execucao, se os modelos ONNX do YuNet e SFace nao estiverem na pasta `models/`, o programa tenta descarrega-los automaticamente para essa pasta.
+
+## Estrutura do codigo
+
+- `main.py`: ponto de entrada. Serve apenas para iniciar o programa.
+- `screenguard_app.py`: compatibilidade com a versao anterior, encaminha para o pacote novo.
+- `screenguard/app.py`: ciclo principal do programa.
+- `screenguard/config.py`: argumentos e escolha do video.
+- `screenguard/media.py`: janela, webcam, video, imagens e audio.
+- `screenguard/guard.py`: regras de calibracao, vigilancia e disparo do alerta.
+- `screenguard/face.py`: modelos, detecao facial e reconhecimento.
+- `screenguard/drawing.py`: desenho controlado pelo nariz.
+- `screenguard/ui.py`: textos, paineis e ecra de alerta.
+- `screenguard/models.py`: classes de dados usadas pelo programa.
+- `screenguard/references.py`: imagens externas e fotos de referencia.
+- `screenguard/utils.py`: funcoes pequenas usadas por varios ficheiros.
+- `models/`: pasta dos modelos ONNX usados pelo OpenCV.
 
 ## Referencias opcionais por pessoa
 
@@ -81,6 +97,7 @@ python main.py .\meu_video.mp4 --hostile-image .\hostile.png
 - `--min-profile-observations 3`: numero minimo de observacoes para um perfil ficar autorizado.
 - `--known-faces-dir .\referencias`: pasta com fotos de referencia por pessoa.
 - `--models-dir .\models`: pasta onde os modelos ONNX sao guardados.
+- `--drawings-dir .\intruder_drawings`: pasta onde os desenhos do intruso sao gravados ao carregar `S`.
 - `--min-face-area-ratio 0.01`: ignora rostos muito pequenos ao fundo.
 - `--edge-margin 0.08`: ignora rostos muito perto das bordas.
 - `--no-fullscreen`: abre a janela em modo normal.
